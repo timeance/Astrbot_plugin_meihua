@@ -1,0 +1,17 @@
+name: astrbot_plugin_meihua
+display_name: 梅花易数助手
+short_desc: 梅花易数排盘校验、知识库解读与连续问卦。
+desc: |
+  支持直接报数或粘贴网站排盘文字，在本地核对本卦、互卦、变卦和动爻，结合《灵签详解》64 卦知识库解读。
+  起卦沿用当前聊天模型、人设与上下文；完整起卦（解卦）独立展示排盘、知识原文和解读，问卦续接本卦记录。
+  可配置独立模型供应商与推理等级、用户和群每日限额及管理员豁免，并清理回复中的常见 Markdown 标记。
+version: "0.2.0"
+author: zariba
+repo: https://github.com/timeance/Astrbot_plugin_meihua
+astrbot_version: ">=4.29.4,<5"
+social_link: https://github.com/timeance
+tags:
+  - 梅花易数
+  - 排盘
+  - 解卦
+  - AI
