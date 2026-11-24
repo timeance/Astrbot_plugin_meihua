@@ -4,31 +4,31 @@
     "type": "string",
     "default": "",
     "_special": "select_provider",
-    "hint": "仅用于完整起卦、解卦和问卦。普通起卦使用 AstrBot 当前会话的模型、人设和聊天流程。"
+    "hint": "仅用于「完整起卦」「解卦」和「问卦」。普通「起卦」直接使用当前会话的聊天模型与人设。"
   },
   "reasoning_effort": {
     "description": "独立解卦推理等级",
     "type": "string",
     "default": "default",
     "options": ["default", "none", "minimal", "low", "medium", "high", "xhigh"],
-    "hint": "仅用于独立解卦。自定义等级支持 OpenAI 兼容 Chat Completions / Responses，需模型支持。Anthropic / Gemini 原生供应商使用 default。不兼容会报错。"
+    "hint": "仅对独立解卦生效。自定义等级仅支持 OpenAI 兼容接口（需模型支持，不兼容会报错）；Anthropic 与 Gemini 原生供应商请保持 default。"
   },
   "daily_user_limit": {
-    "description": "每用户每日次数",
+    "description": "单用户每日次数",
     "type": "int",
     "default": 0,
-    "hint": "0 不限。起卦、完整起卦/解卦、问卦共用；同一机器人下跨群及私聊累计，每次进入模型解读计 1 次，失败也计次。每日北京时间 00:00 重置。"
+    "hint": "0 表示不限。本插件四个命令共用，同一平台、同一机器人下跨群与私聊累计；通过检查进入模型解读计 1 次（失败同样计次），每日北京时间 00:00 重置。"
   },
   "daily_group_limit": {
-    "description": "每群每日总次数",
+    "description": "单群每日总次数",
     "type": "int",
     "default": 0,
-    "hint": "0 不限。群成员共用；用户额度和群额度都需满足。私聊不受群限额限制，管理员调用不扣用户或群额度。"
+    "hint": "0 表示不限。群内成员共享，调用时需同时满足个人与群额度；私聊不受此限制，管理员调用不扣个人或群次数。"
   },
   "admin_ids": {
     "description": "管理员用户 ID",
     "type": "list",
     "default": [],
-    "hint": "填写用户账号 ID（如 QQ 号），列表中的用户和 AstrBot 全局管理员均豁免限额。群管理员身份不会自动获得豁免。"
+    "hint": "填写用户账号 ID（如 QQ 号）。列表内账号及 AstrBot 全局管理员均豁免限额；群管理员身份不会自动豁免。"
   }
 }
