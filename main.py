@@ -107,7 +107,7 @@ def split_message(text, limit=1800):
         yield text
 
 
-@register("astrbot_plugin_meihua", "zariba", "梅花排盘、完整解卦与独立追问", "0.2.0")
+@register("astrbot_plugin_meihua", "zariba", "梅花易数本地排盘校验、64 卦知识库解读与连续问卦", "0.2.0")
 class MeihuaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -120,7 +120,7 @@ class MeihuaPlugin(Star):
 
     @filter.command("起卦", priority=100)
     async def qigua(self, event: AstrMessageEvent):
-        """起卦 + 排盘文字或报数，校验后由当前聊天模型解读。"""
+        """起卦 <报数或排盘>，本地校验卦象后由当前聊天模型解读。"""
         body = command_body(event, "起卦", stop=False)
         try:
             session_key(event)
@@ -197,7 +197,7 @@ class MeihuaPlugin(Star):
 
     @filter.command("完整起卦", alias={"解卦"}, priority=100)
     async def full_qigua(self, event: AstrMessageEvent):
-        """完整起卦 / 解卦 + 排盘文字或报数，独立解读并保存本卦。"""
+        """完整起卦 / 解卦 <报数或排盘>，独立输出排盘、原文与解读并保存本卦。"""
         body = command_body(event, "(?:完整起卦|解卦)")
         try:
             key = session_key(event)
@@ -230,7 +230,7 @@ class MeihuaPlugin(Star):
 
     @filter.command("问卦", priority=100)
     async def wengua(self, event: AstrMessageEvent):
-        """问卦 + 补充背景或问题，接续当前会话中自己的最近一次独立解卦。"""
+        """问卦 <补充背景或问题>，续接当前会话中自己的最近一次独立解卦。"""
         body = command_body(event, "问卦")
         if not body:
             await event.send(event.plain_result("请在「问卦」后填写补充背景或问题。"))
