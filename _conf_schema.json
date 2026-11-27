@@ -4,14 +4,14 @@
     "type": "string",
     "default": "",
     "_special": "select_provider",
-    "hint": "仅用于「完整起卦」「解卦」和「问卦」。普通「起卦」直接使用当前会话的聊天模型与人设。"
+    "hint": "用于「完整起卦」「解卦」及其后续「问卦」。普通「起卦」及其后续「问卦」使用当前会话的聊天模型与人设。"
   },
   "reasoning_effort": {
     "description": "独立解卦推理等级",
     "type": "string",
     "default": "default",
     "options": ["default", "none", "minimal", "low", "medium", "high", "xhigh"],
-    "hint": "仅对独立解卦生效。自定义等级仅支持 OpenAI 兼容接口（需模型支持，不兼容会报错）；Anthropic 与 Gemini 原生供应商请保持 default。"
+    "hint": "仅对独立解卦及其后续「问卦」生效。自定义等级仅支持 OpenAI 兼容接口（需模型支持，不兼容会报错）；Anthropic 与 Gemini 原生供应商请保持 default。"
   },
   "daily_user_limit": {
     "description": "单用户每日次数",
