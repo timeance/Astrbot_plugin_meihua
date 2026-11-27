@@ -111,6 +111,7 @@ def stub_modules():
     modules["astrbot.api.event"].filter = SimpleNamespace(
         command=lambda *args, **kwargs: lambda function: function,
         on_llm_request=lambda **kwargs: lambda function: function,
+        on_llm_response=lambda **kwargs: lambda function: function,
         on_decorating_result=lambda **kwargs: lambda function: function,
     )
     modules["astrbot.api.message_components"].Plain = Plain
@@ -226,6 +227,32 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
             self.context,
             {"provider_id": "selected-model", "reasoning_effort": "xhigh"},
         )
+
+    async def dispatch_native(self, event):
+        handler = (
+            self.plugin.qigua if event.text.startswith("起卦") else self.plugin.wengua
+        )
+        await handler(event)
+        request = SimpleNamespace(
+            prompt=event.text,
+            system_prompt="当前人设",
+            contexts=[{"role": "user", "content": "聊天历史"}],
+            func_tool=object(),
+        )
+        event.set_extra("provider_request", request)
+        await self.plugin.on_native_request(event, request)
+        return request
+
+    async def finish_native(self, event, answer, **overrides):
+        fields = dict(
+            role="assistant",
+            is_chunk=False,
+            tools_call_name=[],
+            completion_text=answer,
+            reasoning_content="HIDDEN",
+        )
+        fields.update(overrides)
+        await self.plugin.save_native_answer(event, SimpleNamespace(**fields))
 
     async def test_multiline_command_full_references_and_no_history(self):
         event = Event("完整起卦 占问: 合成测试事项\n本卦: 水泽节\n变卦: 坎为水")
@@ -566,7 +593,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.stopped)
         self.assertFalse(event.call_llm)
         self.assertFalse(event.get_extra("enable_streaming"))
-        reading = event.get_extra(self.main.NATIVE_PENDING)
+        reading = event.get_extra(self.main.NATIVE_PENDING).reading
         request = SimpleNamespace(
             prompt="原始命令与其他插件资料",
             system_prompt="原有人设和记忆",
@@ -599,21 +626,161 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.wengua(blocked)
         self.assertIn("上限", "".join(blocked.sent))
 
-    async def test_native_cast_does_not_replace_independent_reading(self):
-        await self.plugin.full_qigua(Event("解卦 报数:11 12\n占问:独立事项"))
-        event = Event("起卦 报数:3 4 5\n占问:日常聊天事项")
-        await self.plugin.qigua(event)
-        request = SimpleNamespace(prompt=event.text)
-        event.set_extra("provider_request", request)
-        await self.plugin.on_native_request(event, request)
-        await self.plugin.wengua(Event("问卦 继续独立事项"))
-        prompt = self.provider.calls[-1][0]["prompt"]
-        self.assertIn("独立事项", prompt)
-        self.assertNotIn("日常聊天事项", prompt)
+    async def test_native_cast_and_followups_keep_chart_answers_and_chat_mode(self):
+        self.plugin.config["provider_id"] = ""
+        original = Event("起卦 26 27 回撤半导体")
+        await self.dispatch_native(original)
+        await self.finish_native(original, "### 首次分析\n\n**合成结论**")
+        reading = self.plugin.sessions[self.main.session_key(original)].reading
+        followup = Event("问卦 目前大涨，但是依旧亏损。要不要先回撤")
+        request = await self.dispatch_native(followup)
+        self.assertFalse(followup.stopped)
+        self.assertFalse(followup.call_llm)
+        self.assertFalse(followup.sent)
+        self.assertIn(reading.model_input, request.prompt)
+        self.assertIn("泽火革", request.prompt)
+        self.assertIn("雷火丰", request.prompt)
+        self.assertIn("首次分析", request.prompt)
+        self.assertIn("合成结论", request.prompt)
+        self.assertIn("目前大涨", request.prompt)
+        self.assertIn(self.main.FOLLOWUP_RULES, request.prompt)
+        self.assertNotIn(self.main.REQUEST_RULES, request.prompt)
+        self.assertEqual(request.system_prompt, "当前人设")
+        self.assertEqual(request.contexts, [{"role": "user", "content": "聊天历史"}])
+        self.assertIsNotNone(request.func_tool)
+        await self.finish_native(followup, "补充分析")
+        await self.finish_native(followup, "不应重复保存")
+        second = await self.dispatch_native(Event("问卦 再补充一个条件"))
+        self.assertIn("目前大涨", second.prompt)
+        self.assertIn("补充分析", second.prompt)
+        self.assertNotIn("不应重复保存", second.prompt)
+        self.assertNotIn("HIDDEN", second.prompt)
+        self.manager.get_provider_by_id.assert_not_awaited()
+
+    async def test_new_cast_switches_followup_mode_and_ignores_late_native_answers(
+        self,
+    ):
+        for command in ("起卦", "完整起卦"):
+            with self.subTest(command=command):
+                await self.plugin.full_qigua(Event("解卦 11 12 旧独立事项"))
+                old = Event("起卦 3 4 5 旧日常事项")
+                await self.dispatch_native(old)
+                followup = Event("问卦 旧日常追问")
+                await self.dispatch_native(followup)
+                new = Event(command + " 26 27 新合成事项")
+                if command == "起卦":
+                    await self.dispatch_native(new)
+                    await self.finish_native(new, "新合成解读")
+                else:
+                    self.provider.answer = "新合成解读"
+                    await self.plugin.full_qigua(new)
+                await self.finish_native(old, "旧卦迟到的首次回答")
+                await self.finish_native(followup, "旧卦迟到的追问回答")
+                next_question = Event("问卦 接续检查")
+                if command == "起卦":
+                    prompt = (await self.dispatch_native(next_question)).prompt
+                else:
+                    await self.plugin.wengua(next_question)
+                    prompt = self.provider.calls[-1][0]["prompt"]
+                    self.assertTrue(next_question.stopped)
+                self.assertIn("新合成事项", prompt)
+                self.assertIn("新合成解读", prompt)
+                for text in ("旧独立事项", "旧日常事项", "旧日常追问", "旧卦迟到"):
+                    self.assertNotIn(text, prompt)
+
+    async def test_native_followup_scope_keeps_other_users_charts_separate(self):
+        await self.dispatch_native(Event("起卦 11 12 用户一事项"))
+        await self.dispatch_native(Event("起卦 26 27 用户二事项", sender="user-2"))
+        request = await self.dispatch_native(Event("问卦 继续用户一"))
+        self.assertIn("用户一事项", request.prompt)
+        self.assertNotIn("用户二事项", request.prompt)
+        for scope in (
+            {"sender": "user-3"},
+            {"origin": "test:GroupMessage:group-2"},
+            {"origin": "other:GroupMessage:group-1"},
+            {"origin": "test:FriendMessage:user-1"},
+            {"bot": "bot-2"},
+        ):
+            event = Event("问卦 不可跨范围续接", **scope)
+            await self.plugin.wengua(event)
+            self.assertTrue(event.stopped)
+            self.assertTrue(event.call_llm)
+            self.assertIn("没有你的卦象记录", "".join(event.sent))
+            self.assertIsNone(event.get_extra(self.main.NATIVE_PENDING))
+
+    async def test_native_failed_or_intermediate_responses_do_not_enter_followups(self):
+        original = Event("起卦 26 27 新事项")
+        await self.dispatch_native(original)
+        await self.finish_native(original, "首次错误", role="err")
+        first = Event("问卦 失败的补充背景")
+        request = await self.dispatch_native(first)
+        self.assertIn('"首次解读": ""', request.prompt)
+        for fields in (
+            {"role": "err"},
+            {"is_chunk": True},
+            {"tools_call_name": ["tool"]},
+        ):
+            await self.finish_native(first, "不应保存的内容", **fields)
+        await self.finish_native(first, "")
+        second = await self.dispatch_native(Event("问卦 再试一次"))
+        for text in ("首次错误", "失败的补充背景", "不应保存的内容"):
+            self.assertNotIn(text, second.prompt)
+
+    async def test_native_followup_quota_charges_once_and_denial_preserves_history(
+        self,
+    ):
+        self.plugin.config["daily_user_limit"] = 2
+        original = Event("起卦 11 12")
+        await self.dispatch_native(original)
+        first = Event("问卦 成功追问")
+        request = await self.dispatch_native(first)
+        await self.plugin.on_native_request(first, request)
+        await self.finish_native(first, "成功回答")
+        denied = Event("问卦 超额问题")
+        request = await self.dispatch_native(denied)
+        self.assertTrue(denied.stopped)
+        self.assertTrue(denied.call_llm)
+        self.assertIn("上限", "".join(denied.sent))
+        self.assertEqual(request.prompt, denied.text)
+        session = self.plugin.sessions[self.main.session_key(original)]
+        self.assertEqual(session.turns, [{"用户": "成功追问", "解读": "成功回答"}])
+
+    async def test_native_followup_stops_when_chat_disabled_or_pending_chart_replaced(
+        self,
+    ):
+        original = Event("起卦 11 12 旧事项")
+        await self.dispatch_native(original)
+        with patch.object(self.plugin, "consume_quota", AsyncMock()) as consume:
+            for config in (
+                {"agent_runner": {"runner_type": "dify"}},
+                {"provider_settings": {"enable": False}},
+            ):
+                self.chat_config.clear()
+                self.chat_config.update(config)
+                event = Event("问卦 当前不能解读")
+                await self.plugin.wengua(event)
+                self.assertTrue(event.stopped)
+                self.assertTrue(event.call_llm)
+                self.assertTrue(event.sent)
+                self.assertIsNone(event.get_extra(self.main.NATIVE_PENDING))
+            consume.assert_not_awaited()
+        self.chat_config.clear()
+        pending = Event("问卦 旧卦的待发请求")
+        await self.plugin.wengua(pending)
+        await self.plugin.full_qigua(Event("完整起卦 26 27 新独立事项"))
+        request = SimpleNamespace(prompt="untouched")
+        pending.set_extra("provider_request", request)
+        with patch.object(self.plugin, "consume_quota", AsyncMock()) as consume:
+            await self.plugin.on_native_request(pending, request)
+            consume.assert_not_awaited()
+        self.assertTrue(pending.stopped)
+        self.assertIn("卦象记录已更新", "".join(pending.sent))
+        self.assertEqual(request.prompt, "untouched")
 
     async def test_native_quota_denial_stops_chat_without_modifying_request(self):
         self.plugin.config["daily_user_limit"] = 1
         await self.plugin.full_qigua(Event("完整起卦 11 12"))
+        prior = self.plugin.sessions[self.main.session_key(Event(""))].reading
         event = Event("起卦 3 4 5")
         await self.plugin.qigua(event)
         request = SimpleNamespace(prompt="untouched")
@@ -625,6 +792,7 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.prompt, "untouched")
         self.assertIsNone(event.get_extra(self.main.NATIVE_ACCEPTED))
         self.assertIsNone(event.get_extra(self.main.NATIVE_PENDING))
+        self.assertIs(self.plugin.sessions[self.main.session_key(event)].reading, prior)
 
     async def test_native_hook_ignores_unrelated_chat_and_explicit_plugin_requests(
         self,

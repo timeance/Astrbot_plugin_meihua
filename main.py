@@ -20,6 +20,7 @@ from .quota import QuotaExceeded, QuotaStore
 DATA = Path(__file__).resolve().parent / "data"
 NATIVE_PENDING = "meihua_native_pending"
 NATIVE_ACCEPTED = "meihua_native_accepted"
+NATIVE_TURN = "meihua_native_turn"
 
 NATIVE_GUIDANCE = """
 【梅花插件提供的本次排盘资料】
@@ -27,6 +28,7 @@ NATIVE_GUIDANCE = """
 请结合当前占问与已有聊天背景，按现有对话风格给出解读与建议。
 程序已向用户展示校验摘要，无需重复整份排盘或抄写全部原文。
 以校验后的卦象、动爻和规则边界为准；未复核或缺少的信息不要自行补算。
+本次解读以这里附带的排盘为准，不用其他群友的卦象替换。
 引用知识库时标明《灵签详解》及卦名，推断与原文区分。回答使用纯文本。
 """
 
@@ -52,7 +54,7 @@ FOLLOWUP_RULES = """
 用户正在追问同一卦象，输入包含完整的原始占问、排盘、知识库原文、首次解读和本卦后续问答。
 只回答“当前追问”，结合用户补充的背景；无需重发排盘、完整知识库或整套首次解读。
 既往解读是可核对、可纠正的分析，不是新的知识库依据；引用仍须标明《灵签详解》及卦名。
-不得因追问或补充背景自行更改卦象、动爻、时间和四柱；需要另起一卦时请用户重新发送完整起卦或解卦命令。
+不得因追问或补充背景自行更改卦象、动爻、时间和四柱；需要另起一卦时请用户重新发送起卦、完整起卦或解卦命令。
 首次解读为空表示尚未成功生成，可依据现有排盘和原文回答当前问题，不假称存在先前结论。
 """
 
@@ -61,8 +63,15 @@ FOLLOWUP_RULES = """
 class ReadingSession:
     reading: PreparedReading | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    mode: str = "independent"
     initial_answer: str = ""
     turns: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class NativeTurn:
+    reading: PreparedReading
+    question: str = ""
 
 
 def session_key(event: AstrMessageEvent) -> tuple[str, str, str]:
@@ -72,15 +81,32 @@ def session_key(event: AstrMessageEvent) -> tuple[str, str, str]:
     return origin, event.get_self_id(), sender
 
 
+def stop_command(event: AstrMessageEvent):
+    # AstrBot's call_llm flag suppresses the default LLM dispatch when true.
+    event.should_call_llm(True)
+    event.stop_event()
+
+
 def command_body(event: AstrMessageEvent, command: str, *, stop: bool = True) -> str:
     if stop:
-        # AstrBot's call_llm flag suppresses the default LLM dispatch when true.
-        event.should_call_llm(True)
-        event.stop_event()
+        stop_command(event)
     # Command arguments normalize whitespace; retain the original multiline text.
     return re.sub(
         rf"^{command}(?=\s|$)\s*", "", event.get_message_str().strip(), count=1
     )
+
+
+def followup_input(session: ReadingSession, question: str) -> str:
+    history = json.dumps(
+        {
+            "首次解读": session.initial_answer,
+            "历史问答": session.turns,
+            "当前追问": question,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return session.reading.model_input + "\n\n【本卦问答】\n" + history
 
 
 def build_system_prompt():
@@ -107,7 +133,12 @@ def split_message(text, limit=1800):
         yield text
 
 
-@register("astrbot_plugin_meihua", "zariba", "梅花易数本地排盘校验、64 卦知识库解读与连续问卦", "0.2.0")
+@register(
+    "astrbot_plugin_meihua",
+    "zariba",
+    "梅花易数本地排盘校验、64 卦知识库解读与连续问卦",
+    "0.2.1",
+)
 class MeihuaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -125,22 +156,8 @@ class MeihuaPlugin(Star):
         try:
             session_key(event)
             reading = prepare_reading(body)
-            config = self.context.get_config(umo=event.unified_msg_origin)
-            runner = config.get("agent_runner", {})
-            runner_type = (
-                runner.get("runner_type", "local")
-                if isinstance(runner, dict)
-                else runner
-            )
-            if runner_type not in (None, "local"):
-                raise InputError(
-                    "普通起卦需要 AstrBot 本地聊天流程，请改用「完整起卦」或「解卦」。"
-                )
-            if not config.get("provider_settings", {}).get(
-                "enable", True
-            ) or not await SessionServiceManager.should_process_llm_request(event):
-                event.should_call_llm(True)
-                event.stop_event()
+            if not await self.native_chat_enabled(event):
+                stop_command(event)
                 await self.send_sections(
                     event,
                     reading.summary,
@@ -155,25 +172,56 @@ class MeihuaPlugin(Star):
         else:
             # Sending here prevents AstrBot's default chat dispatch. Defer until
             # its request hook, after persona and conversation have been built.
-            event.set_extra(NATIVE_PENDING, reading)
+            event.set_extra(NATIVE_PENDING, NativeTurn(reading))
             event.set_extra("enable_streaming", False)
             return
-        event.should_call_llm(True)
-        event.stop_event()
+        stop_command(event)
         await self.send_sections(event, message)
+
+    async def native_chat_enabled(self, event: AstrMessageEvent) -> bool:
+        config = self.context.get_config(umo=event.unified_msg_origin)
+        runner = config.get("agent_runner", {})
+        runner_type = (
+            runner.get("runner_type", "local") if isinstance(runner, dict) else runner
+        )
+        if runner_type not in (None, "local"):
+            raise InputError(
+                "普通起卦及其问卦需要 AstrBot 本地聊天流程，请改用「完整起卦」或「解卦」。"
+            )
+        return config.get("provider_settings", {}).get(
+            "enable", True
+        ) and await SessionServiceManager.should_process_llm_request(event)
 
     @filter.on_llm_request(priority=-100)
     async def on_native_request(self, event: AstrMessageEvent, req):
-        reading = event.get_extra(NATIVE_PENDING)
-        if reading is None or req is not event.get_extra("provider_request"):
+        turn = event.get_extra(NATIVE_PENDING)
+        if turn is None or req is not event.get_extra("provider_request"):
             return
         event.set_extra(NATIVE_PENDING, None)
         try:
-            await self.consume_quota(event)
-            req.prompt += "\n\n" + NATIVE_GUIDANCE + "\n" + reading.model_input
-            event.set_extra(NATIVE_ACCEPTED, True)
-            await self.send_sections(event, reading.summary)
-        except (QuotaExceeded, ModelConfigError) as exc:
+            session = self.sessions.setdefault(session_key(event), ReadingSession())
+            async with session.lock:
+                if turn.question:
+                    if session.mode != "native" or session.reading is not turn.reading:
+                        raise InputError("卦象记录已更新，请重新发送「问卦」。")
+                    model_input = followup_input(session, turn.question)
+                else:
+                    model_input = turn.reading.model_input
+                await self.consume_quota(event)
+                if not turn.question:
+                    session.reading = turn.reading
+                    session.mode = "native"
+                    session.initial_answer = ""
+                    session.turns.clear()
+                req.prompt += "\n\n" + NATIVE_GUIDANCE
+                if turn.question:
+                    req.prompt += "\n" + FOLLOWUP_RULES
+                req.prompt += "\n" + model_input
+                event.set_extra(NATIVE_ACCEPTED, True)
+                event.set_extra(NATIVE_TURN, turn)
+                if not turn.question:
+                    await self.send_sections(event, turn.reading.summary)
+        except (InputError, QuotaExceeded, ModelConfigError) as exc:
             message = str(exc)
         except Exception as exc:
             logger.warning("梅花聊天准备失败 (%s)", type(exc).__name__)
@@ -181,9 +229,35 @@ class MeihuaPlugin(Star):
         else:
             return
         # Hook exceptions are swallowed by AstrBot; explicitly stop on denial.
-        event.should_call_llm(True)
-        event.stop_event()
+        stop_command(event)
         await self.send_sections(event, message)
+
+    @filter.on_llm_response(priority=-100)
+    async def save_native_answer(self, event: AstrMessageEvent, response):
+        turn = event.get_extra(NATIVE_TURN)
+        if (
+            turn is None
+            or response is None
+            or response.role != "assistant"
+            or response.is_chunk
+            or response.tools_call_name
+        ):
+            return
+        answer = plain_text(response.completion_text or "").strip()
+        if not answer:
+            return
+        event.set_extra(NATIVE_TURN, None)
+        session = self.sessions.get(session_key(event))
+        if session is None:
+            return
+        async with session.lock:
+            # A response from an earlier cast must never restore the old record.
+            if session.mode != "native" or session.reading is not turn.reading:
+                return
+            if turn.question:
+                session.turns.append({"用户": turn.question, "解读": answer})
+            else:
+                session.initial_answer = answer
 
     @filter.on_decorating_result(priority=-100)
     async def clean_native_result(self, event: AstrMessageEvent):
@@ -220,6 +294,7 @@ class MeihuaPlugin(Star):
             )
             if requested or success:
                 session.reading = reading
+                session.mode = "independent"
                 session.initial_answer = answer if success else ""
                 session.turns.clear()
                 await self.send_sections(
@@ -230,42 +305,56 @@ class MeihuaPlugin(Star):
 
     @filter.command("问卦", priority=100)
     async def wengua(self, event: AstrMessageEvent):
-        """问卦 <补充背景或问题>，续接当前会话中自己的最近一次独立解卦。"""
-        body = command_body(event, "问卦")
+        """问卦 <补充背景或问题>，续接自己的最近一卦，沿用该卦的解读模式。"""
+        body = command_body(event, "问卦", stop=False)
         if not body:
+            stop_command(event)
             await event.send(event.plain_result("请在「问卦」后填写补充背景或问题。"))
             return
         try:
             key = session_key(event)
         except InputError as exc:
+            stop_command(event)
             await event.send(event.plain_result(str(exc)))
             return
         session = self.sessions.get(key)
         if session is None:
+            stop_command(event)
             await event.send(
                 event.plain_result(
-                    "当前会话中没有你的卦象记录，请先发送「完整起卦」或「解卦」和排盘。"
+                    "当前会话中没有你的卦象记录，请先发送「起卦」「完整起卦」或「解卦」和报数或排盘。"
                 )
             )
             return
         async with session.lock:
             if session.reading is None:
+                stop_command(event)
                 await event.send(
                     event.plain_result(
-                        "当前会话中没有你的卦象记录，请先发送「完整起卦」或「解卦」和排盘。"
+                        "当前会话中没有你的卦象记录，请先发送「起卦」「完整起卦」或「解卦」和报数或排盘。"
                     )
                 )
                 return
-            history = json.dumps(
-                {
-                    "首次解读": session.initial_answer,
-                    "历史问答": session.turns,
-                    "当前追问": body,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            model_input = session.reading.model_input + "\n\n【本卦问答】\n" + history
+            if session.mode == "native":
+                try:
+                    if not await self.native_chat_enabled(event):
+                        raise InputError(
+                            "当前会话的 AI 功能已关闭，请开启后重试「问卦」。"
+                        )
+                except InputError as exc:
+                    message = str(exc)
+                except Exception as exc:
+                    logger.warning("梅花问卦准备失败 (%s)", type(exc).__name__)
+                    message = "聊天配置读取失败，请管理员检查聊天设置后重试。"
+                else:
+                    event.set_extra(NATIVE_PENDING, NativeTurn(session.reading, body))
+                    event.set_extra("enable_streaming", False)
+                    return
+                stop_command(event)
+                await self.send_sections(event, message)
+                return
+            stop_command(event)
+            model_input = followup_input(session, body)
             answer, success, _ = await self.model_reply(
                 event, model_input, followup=True
             )
